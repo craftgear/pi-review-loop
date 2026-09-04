@@ -10,6 +10,7 @@ describe("Pi package manifest", () => {
     const packageJson = JSON.parse(
       readFileSync(resolve(packageRoot, "package.json"), "utf8"),
     ) as {
+      license?: string;
       keywords?: string[];
       engines?: { node?: string };
       pi?: {
@@ -18,6 +19,7 @@ describe("Pi package manifest", () => {
       };
     };
 
+    expect(packageJson.license).toBe("MIT");
     expect(packageJson.keywords).toContain("pi-package");
     expect(packageJson.engines?.node).toBe(">=22.19.0");
     expect(packageJson.pi).toEqual({

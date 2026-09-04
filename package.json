@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Run Pi code review and automatic fixes until the worktree is clean.",
   "type": "module",
+  "license": "MIT",
   "engines": {
     "node": ">=22.19.0"
   },

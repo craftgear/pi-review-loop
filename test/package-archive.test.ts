@@ -40,6 +40,7 @@ describe("Pi package archive", () => {
 
     expect(files).toEqual(
       expect.arrayContaining([
+        "LICENSE.md",
         "README.md",
         "extensions/review-loop.ts",
         "package.json",

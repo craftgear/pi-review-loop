@@ -1,6 +1,6 @@
 # pi-review-loop
 
-`pi-review-loop` is a Pi package that reviews the current worktree with `/skill:code-review`, applies actionable fixes, and repeats the review until it is clean or cannot safely continue.
+`pi-review-loop` is a Pi package that reviews the current worktree with the [`code-review`](https://github.com/anthropics/knowledge-work-plugins/blob/main/engineering/skills/code-review/SKILL.md) skill, applies actionable fixes, and repeats the review until it is clean or cannot safely continue.
 
 ## Install
 
@@ -42,7 +42,7 @@ The additional instructions are applied to each review round. A limit from one t
 
 ## Configuration
 
-Set the review prompt in `~/.pi/agent/review-loop.json` for all projects or in `.pi/review-loop.json` for one project:
+Set the review prompt in `~/.pi/agent/review-loop.json` for all projects or in `.pi/review-loop.json` for one project using the [`code-review`](https://github.com/anthropics/knowledge-work-plugins/blob/main/engineering/skills/code-review/SKILL.md) skill:
 
 ```json
 {
@@ -62,7 +62,7 @@ Submitting any other input while the loop is running also stops it, because the 
 
 The loop does not commit, push, merge, create pull requests, or resume automatically after a session reload. Review the proposed file changes and command execution before installing packages from sources you do not trust.
 
-The package uses the existing `code-review` skill resolved from project or user resources. It does not bundle or override a `code-review` skill. Review and fix responses remain normal text. After each review, the loop sends `fix them`; safe fixes are applied automatically, while findings that require user input are recorded and shown when the loop completes.
+The package uses the existing [`code-review`](https://github.com/anthropics/knowledge-work-plugins/blob/main/engineering/skills/code-review/SKILL.md) skill resolved from project or user resources. It does not bundle or override a `code-review` skill. Review and fix responses remain normal text. After each review, the loop sends `fix them`; safe fixes are applied automatically, while findings that require user input are recorded and shown when the loop completes.
 
 When the loop completes successfully, the status is cleared, while the completion notification includes the loop count and elapsed time as `Review loop completed after 2 loops in 1 hour 38 mins.` The completion notification uses warning styling, while the separate final review result uses the normal assistant output styling.
 
