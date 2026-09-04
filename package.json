@@ -1,0 +1,38 @@
+{
+  "name": "pi-review-loop",
+  "version": "0.1.0",
+  "description": "Run Pi code review and automatic fixes until the worktree is clean.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "package.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/review-loop.ts"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "pack:check": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
+  }
+}
