@@ -60,6 +60,14 @@ Stop an active loop with:
 
 Submitting any other input while the loop is running also stops it, because the review and fix sequence can no longer be guaranteed.
 
+Interrupting a turn (for example with Escape) before it produces a result pauses the loop instead of reporting a protocol error. The status then shows `paused 1/10 · reviewing` or `paused 1/10 · fixing`. Resume by sending one of the resume phrases (`go on`, `continue`, `keep going`, `続けて`, `続行`) or by running:
+
+```text
+/review-loop resume
+```
+
+Resuming re-sends the interrupted step's prompt and continues the loop from the same round. Any other input while paused stops the loop, and `/review-loop stop` also works while paused. A pause only lasts for the current session.
+
 The loop does not commit, push, merge, create pull requests, or resume automatically after a session reload. Review the proposed file changes and command execution before installing packages from sources you do not trust.
 
 The package uses the existing [`code-review`](https://github.com/anthropics/knowledge-work-plugins/blob/main/engineering/skills/code-review/SKILL.md) skill resolved from project or user resources. It does not bundle or override a `code-review` skill. Review and fix responses remain normal text. After each review, the loop sends `fix them`; safe fixes are applied automatically, while findings that require user input are recorded and shown when the loop completes.

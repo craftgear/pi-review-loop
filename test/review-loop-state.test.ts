@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MAX_ROUNDS,
   completeReview,
+  createIdleState,
   enterFixing,
   finishFix,
+  pauseLoop,
+  resumeLoop,
   startLoop,
   stopLoop,
 } from "../src/reviewLoopState";
@@ -66,6 +69,52 @@ describe("review loop state", () => {
     expect(() =>
       stopLoop({ phase: "completed", round: 1, maxRounds: 10 }, "abort"),
     ).toThrow("active");
+  });
+
+  it("pauses an active loop and remembers the interrupted phase", () => {
+    expect(pauseLoop(startLoop(3))).toEqual({
+      phase: "paused",
+      round: 1,
+      maxRounds: 3,
+      pausedFrom: "reviewing",
+    });
+    expect(pauseLoop(enterFixing(startLoop(3)))).toEqual({
+      phase: "paused",
+      round: 1,
+      maxRounds: 3,
+      pausedFrom: "fixing",
+    });
+  });
+
+  it("resumes a paused loop into the interrupted phase without extra fields", () => {
+    expect(resumeLoop(pauseLoop(startLoop(3)))).toEqual({
+      phase: "reviewing",
+      round: 1,
+      maxRounds: 3,
+    });
+    expect(resumeLoop(pauseLoop(enterFixing(startLoop(3))))).toEqual({
+      phase: "fixing",
+      round: 1,
+      maxRounds: 3,
+    });
+  });
+
+  it("rejects pausing inactive loops and resuming unparsed states", () => {
+    expect(() => pauseLoop(createIdleState())).toThrow();
+    expect(() => pauseLoop(stopLoop(startLoop(), "abort"))).toThrow();
+    expect(() => resumeLoop(startLoop())).toThrow();
+    expect(() =>
+      resumeLoop({ phase: "paused", round: 1, maxRounds: 10 }),
+    ).toThrow();
+  });
+
+  it("stops a paused loop and drops the paused phase marker", () => {
+    expect(stopLoop(pauseLoop(startLoop()), "shutdown")).toEqual({
+      phase: "stopped",
+      round: 1,
+      maxRounds: DEFAULT_MAX_ROUNDS,
+      stopReason: "shutdown",
+    });
   });
 
   it("rejects invalid limits and invalid phase transitions", () => {

@@ -14,6 +14,8 @@ import {
   enterFixing,
   finishFix,
   isReviewLoopActive,
+  pauseLoop,
+  resumeLoop,
   startLoop,
   stopLoop,
   type ReviewLoopState,
@@ -24,6 +26,14 @@ import {
 } from "../src/reviewLoopConfig";
 
 const COMMAND_NAME = "review-loop";
+const RESUME_PHRASES = [
+  "go on",
+  "continue",
+  "keep going",
+  "続けて",
+  "続行",
+];
+const PAUSE_HINT = "Send go on or run /review-loop resume to continue.";
 const ENTRY_TYPE = "pi-review-loop-state";
 const FINAL_REVIEW_RESULT_ENTRY_TYPE = "pi-review-loop-result";
 const STATUS_KEY = "pi-review-loop";
@@ -66,10 +76,16 @@ function buildReviewPrompt(
   ].join(" ");
 }
 
+function isResumeInput(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  return RESUME_PHRASES.includes(normalized);
+}
+
 interface PersistedReviewLoopState {
   phase: ReviewLoopState["phase"];
   round: number;
   maxRounds: number;
+  pausedFrom?: ReviewLoopState["pausedFrom"];
   duration?: string;
   pendingReview?: string;
   completionReason?: ReviewLoopState["completionReason"];
@@ -122,6 +138,7 @@ function toPersistedState(
     phase: state.phase,
     round: state.round,
     maxRounds: state.maxRounds,
+    ...(state.pausedFrom ? { pausedFrom: state.pausedFrom } : {}),
     ...(duration ? { duration } : {}),
     ...(pendingReview ? { pendingReview } : {}),
     ...(state.completionReason
@@ -158,6 +175,8 @@ function statusText(state: ReviewLoopState): string | undefined {
     return `loop ${state.round}/${state.maxRounds} · reviewing`;
   if (state.phase === "fixing")
     return `loop ${state.round}/${state.maxRounds} · fixing`;
+  if (state.phase === "paused")
+    return `paused ${state.round}/${state.maxRounds} · ${state.pausedFrom ?? "unknown"}`;
   if (state.phase === "completed") return undefined;
   return `stopped: ${state.stopReason ?? "unknown"}`;
 }
@@ -195,6 +214,18 @@ function hasAssistantError(messages: readonly unknown[]): boolean {
     const record = message as { role?: unknown; stopReason?: unknown };
     return record.role === "assistant" && record.stopReason === "error";
   });
+}
+
+// 最後の assistant メッセージが abort なら、そのターンは結果を出せずに中断された
+function wasTurnAborted(messages: readonly unknown[]): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (typeof message !== "object" || message === null) continue;
+    const record = message as { role?: unknown; stopReason?: unknown };
+    if (record.role !== "assistant") continue;
+    return record.stopReason === "aborted";
+  }
+  return false;
 }
 
 export default function reviewLoopExtension(pi: ExtensionAPI): void {
@@ -382,25 +413,65 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     }
   }
 
+  function buildStepPrompt(phase: "reviewing" | "fixing"): string {
+    return phase === "reviewing"
+      ? buildReviewPrompt(configuredReviewPrompt, reviewInstructions)
+      : FIX_PROMPT;
+  }
+
+  function pauseForAbort(ctx: ExtensionContext): void {
+    persistAndDisplay(pauseLoop(state), ctx);
+    ctx.ui.notify(`Review loop paused. ${PAUSE_HINT}`, "warning");
+  }
+
+  async function resumeLoopFromPause(
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const resumed = resumeLoop(state);
+    persistAndDisplay(resumed, ctx);
+    ctx.ui.notify("Review loop resumed.", "info");
+    await startPendingPrompt(
+      {
+        content: buildStepPrompt(resumed.phase),
+        expandPromptTemplates: resumed.phase === "reviewing",
+      },
+      ctx,
+    );
+  }
+
   pi.registerCommand(COMMAND_NAME, {
     description:
       "Review and automatically fix the current worktree until clean.",
     handler: async (args, ctx) => {
       const argument = args.trim();
       if (argument === "stop") {
-        if (!isReviewLoopActive(state)) {
+        if (!isReviewLoopActive(state) && state.phase !== "paused") {
           ctx.ui.notify("Review loop is not running.", "info");
           return;
         }
-        ctx.abort();
+        // paused 中は走っているターンがないため abort は不要
+        if (isReviewLoopActive(state)) ctx.abort();
         resetRunData();
         persistAndDisplay(stopLoop(state, "abort"), ctx);
         ctx.ui.notify("Review loop stopped.", "info");
         return;
       }
 
+      if (argument === "resume") {
+        if (state.phase !== "paused") {
+          ctx.ui.notify("Review loop is not paused.", "info");
+          return;
+        }
+        await resumeLoopFromPause(ctx);
+        return;
+      }
+
       if (isReviewLoopActive(state)) {
         ctx.ui.notify("Review loop is already running.", "warning");
+        return;
+      }
+      if (state.phase === "paused") {
+        ctx.ui.notify(`Review loop is paused. ${PAUSE_HINT}`, "warning");
         return;
       }
       if (!ctx.isIdle()) {
@@ -458,9 +529,23 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("input", async (event, ctx) => {
-    // ユーザー自身が入力するとレビュー/修正の順序保証が破れるため停止する。
     // 拡張機能が送るプロンプト（source: "extension"）は対象外。
-    if (!isReviewLoopActive(state) || event.source === "extension") return;
+    if (event.source === "extension") return;
+
+    if (state.phase === "paused") {
+      // 再開フレーズなら消費してループを再開し、それ以外は停止して通常通り通過させる
+      if (isResumeInput(event.text)) {
+        await resumeLoopFromPause(ctx);
+        return { action: "handled" };
+      }
+      resetRunData();
+      persistAndDisplay(stopLoop(state, "abort"), ctx);
+      ctx.ui.notify("Review loop stopped: user input received.", "warning");
+      return;
+    }
+
+    // ユーザー自身が入力するとレビュー/修正の順序保証が破れるため停止する。
+    if (!isReviewLoopActive(state)) return;
     resetRunData();
     persistAndDisplay(stopLoop(state, "abort"), ctx);
     ctx.ui.notify("Review loop stopped: user input received.", "warning");
@@ -476,6 +561,11 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     if (state.phase === "reviewing") {
       const reviewText = extractAssistantText(event.messages);
       if (!reviewText) {
+        // テキストのない中断は再開可能なので protocol error にはしない
+        if (wasTurnAborted(event.messages)) {
+          pauseForAbort(ctx);
+          return;
+        }
         agentEndWithoutText = true;
         return;
       }
@@ -508,6 +598,11 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
 
     const fixText = extractAssistantText(event.messages);
     if (!fixText) {
+      // テキストのない中断は再開可能なので protocol error にはしない
+      if (wasTurnAborted(event.messages)) {
+        pauseForAbort(ctx);
+        return;
+      }
       agentEndWithoutText = true;
       return;
     }
@@ -564,7 +659,7 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    if (isReviewLoopActive(state)) {
+    if (isReviewLoopActive(state) || state.phase === "paused") {
       persistAndDisplay(stopLoop(state, "shutdown"), ctx);
     } else {
       loopStartedAt = undefined;

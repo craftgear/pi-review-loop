@@ -5,6 +5,7 @@ export type ReviewLoopPhase =
   | "idle"
   | "reviewing"
   | "fixing"
+  | "paused"
   | "completed"
   | "stopped";
 export type ReviewLoopCompletionReason = "no_changes" | "max_rounds";
@@ -17,9 +18,15 @@ export interface ReviewLoopState {
   phase: ReviewLoopPhase;
   round: number;
   maxRounds: number;
+  /** The phase to return to when a paused loop is resumed. */
+  pausedFrom?: "reviewing" | "fixing";
   completionReason?: ReviewLoopCompletionReason;
   stopReason?: ReviewLoopStopReason;
 }
+
+export type ActiveReviewLoopState = ReviewLoopState & {
+  phase: "reviewing" | "fixing";
+};
 
 export type ReviewLoopNextAction = "review" | "completed" | "stopped";
 
@@ -52,7 +59,9 @@ export function startLoop(maxRounds?: number): ReviewLoopState {
   };
 }
 
-export function isReviewLoopActive(state: ReviewLoopState): boolean {
+export function isReviewLoopActive(
+  state: ReviewLoopState,
+): state is ActiveReviewLoopState {
   return state.phase === "reviewing" || state.phase === "fixing";
 }
 
@@ -60,6 +69,25 @@ function requireActive(state: ReviewLoopState): void {
   if (!isReviewLoopActive(state)) {
     throw new Error(`Review loop is not active: ${state.phase}`);
   }
+}
+
+export function pauseLoop(state: ReviewLoopState): ReviewLoopState {
+  if (!isReviewLoopActive(state)) {
+    throw new Error(`Cannot pause an inactive review loop: ${state.phase}`);
+  }
+  return {
+    ...state,
+    phase: "paused",
+    pausedFrom: state.phase,
+  };
+}
+
+export function resumeLoop(state: ReviewLoopState): ActiveReviewLoopState {
+  if (state.phase !== "paused" || !state.pausedFrom) {
+    throw new Error(`Cannot resume an unpaused review loop: ${state.phase}`);
+  }
+  const { pausedFrom, ...rest } = state;
+  return { ...rest, phase: pausedFrom };
 }
 
 export function enterFixing(state: ReviewLoopState): ReviewLoopState {
@@ -120,9 +148,12 @@ export function stopLoop(
   state: ReviewLoopState,
   stopReason: ReviewLoopStopReason,
 ): ReviewLoopState {
-  requireActive(state);
+  if (!isReviewLoopActive(state) && state.phase !== "paused") {
+    throw new Error(`Review loop is not active: ${state.phase}`);
+  }
+  const { pausedFrom, ...rest } = state;
   return {
-    ...state,
+    ...rest,
     phase: "stopped",
     stopReason,
   };

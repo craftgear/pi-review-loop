@@ -113,8 +113,10 @@ async function emit(
   event: string,
   context: FakeContext,
   payload: unknown = {},
-): Promise<void> {
-  await pi.events.get(event)?.(payload, context);
+): Promise<unknown> {
+  const handler = pi.events.get(event);
+  if (!handler) return undefined;
+  return await handler(payload, context);
 }
 
 function assistantEvent(text: string): { messages: unknown[] } {
@@ -126,6 +128,28 @@ function assistantEvent(text: string): { messages: unknown[] } {
       },
     ],
   };
+}
+
+function abortedEvent(): { messages: unknown[] } {
+  return {
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "interrupted mid-turn" }],
+        stopReason: "aborted",
+      },
+    ],
+  };
+}
+
+async function runLoop(
+  pi: FakePi,
+  context: FakeContext,
+  args = "",
+): Promise<void> {
+  const command = pi.commands.get("review-loop");
+  if (!command) throw new Error("review-loop command was not registered");
+  await command.handler(args, context);
 }
 
 function toolEnd(toolName: string, isError = false): unknown {
@@ -582,6 +606,236 @@ describe("review loop extension", () => {
     expect(lastStateEntry(pi)).toEqual({
       type: "pi-review-loop-state",
       data: expect.objectContaining({ stopReason: "protocol_error" }),
+    });
+  });
+
+  it("pauses a review turn aborted before it produced a result", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, abortedEvent());
+
+    expect(context.ui.setStatus).toHaveBeenLastCalledWith(
+      "pi-review-loop",
+      "paused 1/10 · reviewing",
+    );
+    expect(lastStateEntry(pi)).toEqual({
+      type: "pi-review-loop-state",
+      data: expect.objectContaining({
+        phase: "paused",
+        pausedFrom: "reviewing",
+      }),
+    });
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      "Review loop paused. Send go on or run /review-loop resume to continue.",
+      "warning",
+    );
+
+    // Settling after the abort must not stop the paused loop.
+    await emit(pi, "agent_settled", context);
+
+    expect(lastStateEntry(pi)).toEqual({
+      type: "pi-review-loop-state",
+      data: expect.objectContaining({
+        phase: "paused",
+        pausedFrom: "reviewing",
+      }),
+    });
+  });
+
+  it("pauses a fixing turn aborted before it produced a result", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, assistantEvent("A finding remains."));
+    await emit(pi, "agent_settled", context);
+    await emit(pi, "agent_end", context, abortedEvent());
+
+    expect(context.ui.setStatus).toHaveBeenLastCalledWith(
+      "pi-review-loop",
+      "paused 1/10 · fixing",
+    );
+    expect(lastStateEntry(pi)).toEqual({
+      type: "pi-review-loop-state",
+      data: expect.objectContaining({
+        phase: "paused",
+        pausedFrom: "fixing",
+      }),
+    });
+  });
+
+  it("treats an aborted review that already produced a result as a completed review", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "No findings remain." }],
+          stopReason: "aborted",
+        },
+      ],
+    });
+
+    expect(context.ui.setStatus).toHaveBeenLastCalledWith(
+      "pi-review-loop",
+      "loop 1/10 · fixing",
+    );
+  });
+
+  it("resumes a paused review when the user sends go on", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, abortedEvent());
+    const result = await emit(pi, "input", context, {
+      text: "go on",
+      source: "interactive",
+    });
+
+    expect(result).toEqual({ action: "handled" });
+    expect(context.ui.setStatus).toHaveBeenLastCalledWith(
+      "pi-review-loop",
+      "loop 1/10 · reviewing",
+    );
+    expect(pi.sentMessages.at(-1)).toEqual({
+      content: DEFAULT_REVIEW_PROMPT,
+      options: { expandPromptTemplates: true },
+    });
+
+    // The resumed review continues the loop into fixing.
+    await emit(pi, "agent_end", context, assistantEvent("A finding remains."));
+    await emit(pi, "agent_settled", context);
+    expect(context.ui.setStatus).toHaveBeenLastCalledWith(
+      "pi-review-loop",
+      "loop 1/10 · fixing",
+    );
+    expect(pi.sentMessages.at(-1)).toEqual({
+      content: expect.stringContaining("fix them"),
+      options: undefined,
+    });
+  });
+
+  it("resumes a paused fix when the user sends go on", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, assistantEvent("A finding remains."));
+    await emit(pi, "agent_settled", context);
+    await emit(pi, "agent_end", context, abortedEvent());
+    const result = await emit(pi, "input", context, {
+      text: "go on",
+      source: "interactive",
+    });
+
+    expect(result).toEqual({ action: "handled" });
+    expect(pi.sentMessages.at(-1)).toEqual({
+      content: expect.stringContaining("fix them"),
+      options: undefined,
+    });
+  });
+
+  it("matches resume phrases case-insensitively and ignores surrounding whitespace", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, abortedEvent());
+    const result = await emit(pi, "input", context, {
+      text: "  GO ON  ",
+      source: "interactive",
+    });
+
+    expect(result).toEqual({ action: "handled" });
+    expect(lastStateEntry(pi)).toEqual({
+      type: "pi-review-loop-state",
+      data: expect.objectContaining({ phase: "reviewing", round: 1 }),
+    });
+  });
+
+  it("stops a paused loop when the user sends other input", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, abortedEvent());
+    const result = await emit(pi, "input", context, {
+      text: "explain the change",
+      source: "interactive",
+    });
+
+    expect(result).toBeUndefined();
+    expect(lastStateEntry(pi)).toEqual({
+      type: "pi-review-loop-state",
+      data: expect.objectContaining({ phase: "stopped", stopReason: "abort" }),
+    });
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      "Review loop stopped: user input received.",
+      "warning",
+    );
+  });
+
+  it("resumes a paused loop with /review-loop resume and refuses when not paused", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context, "resume");
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      "Review loop is not paused.",
+      "info",
+    );
+    expect(pi.sentMessages).toHaveLength(0);
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, abortedEvent());
+    await runLoop(pi, context, "resume");
+
+    expect(context.ui.setStatus).toHaveBeenLastCalledWith(
+      "pi-review-loop",
+      "loop 1/10 · reviewing",
+    );
+    expect(pi.sentMessages.at(-1)).toEqual({
+      content: DEFAULT_REVIEW_PROMPT,
+      options: { expandPromptTemplates: true },
+    });
+  });
+
+  it("cancels a paused loop with /review-loop stop without aborting the agent", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, abortedEvent());
+    await runLoop(pi, context, "stop");
+
+    expect(context.abort).not.toHaveBeenCalled();
+    expect(context.ui.setStatus).toHaveBeenLastCalledWith(
+      "pi-review-loop",
+      "stopped: abort",
+    );
+  });
+
+  it("does not start a new loop while paused", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, abortedEvent());
+    await runLoop(pi, context);
+
+    expect(pi.sentMessages).toHaveLength(1);
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      "Review loop is paused. Send go on or run /review-loop resume to continue.",
+      "warning",
+    );
+  });
+
+  it("persists a shutdown stop while paused", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context);
+    await emit(pi, "agent_end", context, abortedEvent());
+    await emit(pi, "session_shutdown", context);
+
+    expect(lastStateEntry(pi)).toEqual({
+      type: "pi-review-loop-state",
+      data: expect.objectContaining({ phase: "stopped", stopReason: "shutdown" }),
     });
   });
 
