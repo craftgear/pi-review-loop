@@ -24,8 +24,19 @@ import {
   DEFAULT_REVIEW_PROMPT,
   loadReviewPrompt,
 } from "../src/reviewLoopConfig";
+import {
+  DECISION_ITEMS_PROMPT,
+  parseDecisionItems,
+  type ReviewDecisionPreviewItem,
+} from "../src/reviewDecisionItems";
+import {
+  PREVIEW_DECISION_ITEMS,
+  ReviewDecisionPreviewComponent,
+  type ReviewDecisionPreviewResult,
+} from "./review-decision-preview";
 
 const COMMAND_NAME = "review-loop";
+const PREVIEW_COMMAND_NAME = "review-loop-preview";
 const RESUME_PHRASES = [
   "go on",
   "continue",
@@ -37,6 +48,12 @@ const PAUSE_HINT = "Send go on or run /review-loop resume to continue.";
 const ENTRY_TYPE = "pi-review-loop-state";
 const FINAL_REVIEW_RESULT_ENTRY_TYPE = "pi-review-loop-result";
 const STATUS_KEY = "pi-review-loop";
+// 決定 UI はループ完了時のみ一時的に無効化している。UI コードは残しているため、
+// true に戻せば完了時に決定 UI を開く元の挙動へ戻る。
+const DECISION_UI_ON_COMPLETION = false;
+// レビュー/修正プロンプトへの判断必要 finding を json ブロックで出力させる指示は
+// 一時的に無効化している。true に戻せばエージェントが決定項目を出力する元の挙動へ戻る。
+const DECISION_ITEMS_PROMPT_ENABLED = false;
 const CONFIG_FILE_NAME = "review-loop.json";
 const HASH_CONCURRENCY = 8;
 const GIT_COMMAND_TIMEOUT_MS = 5_000;
@@ -47,8 +64,16 @@ const FIX_PROMPT = [
   "fix them",
   "Apply only safe, actionable fixes from the preceding review.",
   "Leave findings that require a user decision unchanged and mention them in your response.",
+  ...(DECISION_ITEMS_PROMPT_ENABLED ? [DECISION_ITEMS_PROMPT] : []),
   COMPACT_OUTPUT_PROMPT,
 ].join(" ");
+
+// ctx.shutdown() はフラグを立てるだけで agent_settled イベント発火時に処理される。
+// エージェントが待機中の決定画面からは発火しないため、pi 自身の SIGTERM
+// ハンドラ経由で即座に graceful 終了する（session_shutdown と端末復元もされる）。
+function requestImmediateShutdown(): void {
+  process.kill(process.pid, "SIGTERM");
+}
 
 function parseReviewLoopArguments(argument: string): {
   maxRounds?: number;
@@ -64,6 +89,24 @@ function parseReviewLoopArguments(argument: string): {
   return argument ? { reviewPrompt: argument } : {};
 }
 
+// ユーザー決定に基づく修正依頼プロンプト（エージェントには英語で送る）
+function buildDecisionFixPrompt(
+  items: readonly ReviewDecisionPreviewItem[],
+  result: ReviewDecisionPreviewResult,
+): string {
+  const decisionLines = result.decisions.map((decision) => {
+    const item = items.find((entry) => entry.id === decision.id);
+    return `- ${item?.title ?? decision.id}: ${decision.value}`;
+  });
+  return [
+    "The review loop left the following findings pending a user decision. The user has now chosen an action for each one:",
+    ...decisionLines,
+    "Apply the chosen action for each finding. Apply only safe, actionable fixes.",
+    "If a chosen action defers or declines a fix, leave that code unchanged and mention it in your response.",
+    COMPACT_OUTPUT_PROMPT,
+  ].join("\n");
+}
+
 function buildReviewPrompt(
   reviewPrompt: string,
   additionalInstructions: string | undefined,
@@ -73,6 +116,8 @@ function buildReviewPrompt(
     ...(additionalInstructions
       ? [`Additional review instructions: ${additionalInstructions}`]
       : []),
+    // 設定されたプロンプトが何であっても判断必要 finding は JSON で出力させる（一時的に無効化中）
+    ...(DECISION_ITEMS_PROMPT_ENABLED ? [DECISION_ITEMS_PROMPT] : []),
   ].join(" ");
 }
 
@@ -167,6 +212,19 @@ function formatDuration(durationMs: number): string {
   }
   if (minutes > 0) return formatUnit(minutes, "min", "mins");
   return formatUnit(seconds, "sec", "secs");
+}
+
+function formatFinalReviewResult(pendingReview: string): string {
+  return [
+    "Review loop completed.",
+    "",
+    "User decisions required",
+    "",
+    "Review the following findings and choose an action for each one.",
+    "",
+    "Final review result:",
+    pendingReview,
+  ].join("\n");
 }
 
 function statusText(state: ReviewLoopState): string | undefined {
@@ -373,13 +431,75 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
         "warning",
       );
     }
-    if (isTerminal && pendingReview) {
-      pi.appendEntry<FinalReviewResultEntry>(
-        FINAL_REVIEW_RESULT_ENTRY_TYPE,
-        { content: `Final review result:\n${pendingReview}` },
-      );
-    }
     if (isTerminal) loopStartedAt = undefined;
+  }
+
+  function appendFinalReviewResult(pendingReview: string): void {
+    pi.appendEntry<FinalReviewResultEntry>(
+      FINAL_REVIEW_RESULT_ENTRY_TYPE,
+      { content: formatFinalReviewResult(pendingReview) },
+    );
+  }
+
+  // ループ完了時にユーザー判断が必要な finding があれば決定 UI を表示し（TUI のみ、
+  // DECISION_UI_ON_COMPLETION で一時的に無効化中）、全項目が決定されたら
+  // 決定に基づいて修正を自動開始する
+  async function completeLoop(
+    nextState: ReviewLoopState,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    const pendingReview = getPendingReviewText();
+    persistAndDisplay(nextState, ctx, pendingReview);
+    if (!pendingReview) return;
+
+    const items = parseDecisionItems(pendingReview);
+    if (
+      !DECISION_UI_ON_COMPLETION ||
+      !items ||
+      !ctx.hasUI ||
+      ctx.mode !== "tui"
+    ) {
+      appendFinalReviewResult(pendingReview);
+      return;
+    }
+
+    let result: ReviewDecisionPreviewResult;
+    try {
+      result = await ctx.ui.custom<ReviewDecisionPreviewResult>(
+        (tui, theme, _keybindings, done) =>
+          new ReviewDecisionPreviewComponent(
+            items,
+            tui,
+            theme,
+            done,
+            // 単発 Ctrl+C で即座に graceful 終了する
+            requestImmediateShutdown,
+          ),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendFinalReviewResult(pendingReview);
+      ctx.ui.notify(`Could not open the decision preview: ${message}`, "error");
+      return;
+    }
+
+    if (result.cancelled || result.decisions.length < items.length) {
+      appendFinalReviewResult(pendingReview);
+      ctx.ui.notify(
+        "Decision preview closed. The findings are listed in the final review result.",
+        "info",
+      );
+      return;
+    }
+
+    // 全項目が決定済み: 決定に基づいて修正を自動開始する
+    ctx.ui.notify("All findings decided. Starting fixes.", "info");
+    try {
+      await pi.sendUserMessage(buildDecisionFixPrompt(items, result));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Could not start fixing: ${message}`, "error");
+    }
   }
 
   function stopForProtocolError(ctx: ExtensionContext, message: string): void {
@@ -510,6 +630,53 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand(PREVIEW_COMMAND_NAME, {
+    description: "Preview the interactive user-decision review UI.",
+    handler: async (_args, ctx) => {
+      if (!ctx.hasUI || ctx.mode !== "tui") {
+        ctx.ui.notify(
+          "The review decision preview is available only in TUI mode.",
+          "warning",
+        );
+        return;
+      }
+
+      const result = await ctx.ui.custom<ReviewDecisionPreviewResult>(
+        (tui, theme, _keybindings, done) =>
+          new ReviewDecisionPreviewComponent(
+            PREVIEW_DECISION_ITEMS,
+            tui,
+            theme,
+            done,
+            // 単発 Ctrl+C で即座に graceful 終了する
+            requestImmediateShutdown,
+          ),
+      );
+
+      if (result.cancelled) {
+        ctx.ui.notify("Review decision preview closed.", "info");
+        return;
+      }
+      if (result.decisions.length < PREVIEW_DECISION_ITEMS.length) {
+        ctx.ui.notify(
+          `Preview completed with ${result.decisions.length}/${PREVIEW_DECISION_ITEMS.length} decisions.`,
+          "info",
+        );
+        return;
+      }
+      // 全項目が決定済み: 決定に基づいて修正を自動開始する
+      ctx.ui.notify("All findings decided. Starting fixes.", "info");
+      try {
+        await pi.sendUserMessage(
+          buildDecisionFixPrompt(PREVIEW_DECISION_ITEMS, result),
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Could not start fixing: ${message}`, "error");
+      }
+    },
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     state = createIdleState();
     resetRunData();
@@ -572,11 +739,7 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
       agentEndWithoutText = false;
       latestReviewText = reviewText;
       if (state.round >= state.maxRounds) {
-        persistAndDisplay(
-          completeReview(state, "max_rounds"),
-          ctx,
-          getPendingReviewText(),
-        );
+        await completeLoop(completeReview(state, "max_rounds"), ctx);
         return;
       }
 
@@ -626,11 +789,7 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     beforeFixFingerprint = undefined;
     const transition = finishFix(state, changed);
     if (transition.next === "completed") {
-      persistAndDisplay(
-        transition.state,
-        ctx,
-        getPendingReviewText(),
-      );
+      await completeLoop(transition.state, ctx);
       return;
     }
 

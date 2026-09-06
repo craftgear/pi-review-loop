@@ -40,6 +40,14 @@ The default limit is ten review rounds. An optional round limit and additional r
 
 The additional instructions are applied to each review round. A limit from one to ten can be supplied.
 
+Preview the interactive user-decision UI without starting a review:
+
+```text
+/review-loop-preview
+```
+
+The preview demonstrates per-issue accordion sections, preset actions, custom decisions, and persistent keyboard hints. Use the arrow keys to move or choose, Space to expand or collapse an issue, j/k or the mouse wheel to scroll the issue details, PgUp/PgDn for page scrolling, Enter to confirm, Tab to move to the next issue, and Escape to go back or close the preview.
+
 ## Configuration
 
 Set the review prompt in `~/.pi/agent/review-loop.json` for all projects or in `.pi/review-loop.json` for one project using the [`code-review`](https://github.com/anthropics/knowledge-work-plugins/blob/main/engineering/skills/code-review/SKILL.md) skill:
@@ -70,7 +78,7 @@ Resuming re-sends the interrupted step's prompt and continues the loop from the 
 
 The loop does not commit, push, merge, create pull requests, or resume automatically after a session reload. Review the proposed file changes and command execution before installing packages from sources you do not trust.
 
-The package uses the existing [`code-review`](https://github.com/anthropics/knowledge-work-plugins/blob/main/engineering/skills/code-review/SKILL.md) skill resolved from project or user resources. It does not bundle or override a `code-review` skill. Review and fix responses remain normal text. After each review, the loop sends `fix them`; safe fixes are applied automatically, while findings that require user input are recorded and shown when the loop completes.
+The package uses the existing [`code-review`](https://github.com/anthropics/knowledge-work-plugins/blob/main/engineering/skills/code-review/SKILL.md) skill resolved from project or user resources. It does not bundle or override a `code-review` skill. Review and fix responses remain normal text. After each review, the loop sends `fix them`; safe fixes are applied automatically, while findings that require user input are recorded and shown when the loop completes under `User decisions required`. The fix prompt asks for each such finding's impact, decision criteria, and available actions, with separate paragraphs for those sections.
 
 When the loop completes successfully, the status is cleared, while the completion notification includes the loop count and elapsed time as `Review loop completed after 2 loops in 1 hour 38 mins.` The completion notification uses warning styling, while the separate final review result uses the normal assistant output styling.
 

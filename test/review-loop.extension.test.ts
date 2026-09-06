@@ -12,7 +12,10 @@ type FakeContext = {
   ui: {
     notify: ReturnType<typeof vi.fn>;
     setStatus: ReturnType<typeof vi.fn>;
+    custom: ReturnType<typeof vi.fn>;
   };
+  mode: "tui" | "rpc" | "json" | "print";
+  hasUI: boolean;
   isIdle: ReturnType<typeof vi.fn>;
   abort: ReturnType<typeof vi.fn>;
   cwd: string;
@@ -80,7 +83,10 @@ function createContext(overrides: Partial<FakeContext> = {}): FakeContext {
     ui: {
       notify: vi.fn(),
       setStatus: vi.fn(),
+      custom: vi.fn(async () => ({ cancelled: true, decisions: [] })),
     },
+    mode: "tui",
+    hasUI: true,
     isIdle: vi.fn(() => true),
     abort: vi.fn(),
     cwd: "/tmp/pi-review-loop-test",
@@ -142,6 +148,23 @@ function abortedEvent(): { messages: unknown[] } {
   };
 }
 
+const DECISION_JSON = [
+  "```json",
+  "[",
+  "  {",
+  '    "id": "admin-list-overflow",',
+  '    "title": "Long user names overflow the admin list",',
+  '    "category": "ui",',
+  '    "priority": "low",',
+  '    "recommendation": "Postpone is acceptable.",',
+  '    "impact": "Only the admin display is affected.",',
+  '    "criteria": ["No security impact."],',
+  '    "actions": ["Fix in this release", "Postpone"]',
+  "  }",
+  "]",
+  "```",
+].join("\n");
+
 async function runLoop(
   pi: FakePi,
   context: FakeContext,
@@ -171,6 +194,72 @@ describe("review loop extension", () => {
       temporaryDirectories
         .splice(0)
         .map((directory) => rm(directory, { recursive: true, force: true })),
+    );
+  });
+
+  it("opens the interactive user-decision preview without starting a review", async () => {
+    const { pi, context } = installExtension();
+    const command = pi.commands.get("review-loop-preview");
+    if (!command) throw new Error("review-loop-preview command was not registered");
+
+    await command.handler("", context);
+
+    // The preview is an inline (non-overlay) UI that replaces the editor area
+    expect(context.ui.custom).toHaveBeenCalledWith(expect.any(Function));
+    expect(pi.sentMessages).toHaveLength(0);
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      "Review decision preview closed.",
+      "info",
+    );
+  });
+
+  it("starts fixing with an English prompt when every issue is decided", async () => {
+    const { pi, context } = installExtension();
+    context.ui.custom.mockResolvedValueOnce({
+      cancelled: false,
+      decisions: [
+        { id: "long-user-name", value: "Postpone", type: "preset" },
+        { id: "payment-failure-message", value: "保留対応", type: "custom" },
+      ],
+    });
+    const command = pi.commands.get("review-loop-preview");
+    if (!command) throw new Error("review-loop-preview command was not registered");
+
+    await command.handler("", context);
+
+    expect(pi.sentMessages).toHaveLength(1);
+    const prompt = pi.sentMessages[0].content;
+    expect(prompt).toContain(
+      "Long user names overflow the admin list: Postpone",
+    );
+    expect(prompt).toContain(
+      "Payment failures do not explain the next step: 保留対応",
+    );
+    expect(prompt).toContain("Apply only safe, actionable fixes");
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      "All findings decided. Starting fixes.",
+      "info",
+    );
+  });
+
+  it("surfaces an error when the decision fix prompt cannot be queued", async () => {
+    const { pi, context } = installExtension();
+    context.ui.custom.mockResolvedValueOnce({
+      cancelled: false,
+      decisions: [
+        { id: "long-user-name", value: "Postpone", type: "preset" },
+        { id: "payment-failure-message", value: "Postpone", type: "preset" },
+      ],
+    });
+    pi.sendUserMessage.mockRejectedValueOnce(new Error("queue failed"));
+    const command = pi.commands.get("review-loop-preview");
+    if (!command) throw new Error("review-loop-preview command was not registered");
+
+    await command.handler("", context);
+
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      "Could not start fixing: queue failed",
+      "error",
     );
   });
 
@@ -464,9 +553,8 @@ describe("review loop extension", () => {
 
     await command.handler("", context);
 
-    expect(pi.sentMessages[0].content).toBe(
-      "Review only the authentication flow.",
-    );
+    // 無効化中はカスタム reviewPrompt にも JSON 出力指示は付与されない
+    expect(pi.sentMessages[0].content).toBe("Review only the authentication flow.");
   });
 
   it("accepts a review prompt without an explicit round limit", async () => {
@@ -541,6 +629,8 @@ describe("review loop extension", () => {
     );
     await emit(pi, "agent_settled", context);
 
+    // 無効化中は修正プロンプトに JSON 出力指示が含まれない
+    expect(pi.sentMessages[1].content).not.toContain("fenced json block");
     expect(context.ui.notify).not.toHaveBeenCalledWith(
       expect.stringContaining("Final review result:\n"),
       expect.anything(),
@@ -548,7 +638,15 @@ describe("review loop extension", () => {
     expect(pi.entries).toContainEqual({
       type: "pi-review-loop-result",
       data: {
-        content: expect.stringContaining("requires a user decision"),
+        content: expect.stringContaining("User decisions required"),
+      },
+    });
+    expect(pi.entries).toContainEqual({
+      type: "pi-review-loop-result",
+      data: {
+        content: expect.stringContaining(
+          "Review the following findings and choose an action for each one.",
+        ),
       },
     });
     expect(lastStateEntry(pi)).toEqual({
@@ -558,6 +656,91 @@ describe("review loop extension", () => {
         completionReason: "no_changes",
         pendingReview: expect.stringContaining("I left the decision pending."),
       }),
+    });
+  });
+
+  it("keeps the decision UI disabled at completion and falls back to a text result", async () => {
+    const { pi, context } = installExtension();
+
+    await runLoop(pi, context, "1");
+    await emit(
+      pi,
+      "agent_end",
+      context,
+      assistantEvent(`Review found one finding.\n\n${DECISION_JSON}`),
+    );
+
+    // UI 無効中は TUI モードで item がパースできても決定画面は開かない
+    expect(context.ui.custom).not.toHaveBeenCalled();
+    expect(context.ui.notify).not.toHaveBeenCalledWith(
+      expect.stringContaining("Decision preview closed"),
+      "info",
+    );
+    // 保留中の finding はテキストフォールバックの entry に一覧される
+    expect(pi.entries).toContainEqual({
+      type: "pi-review-loop-result",
+      data: { content: expect.stringContaining("User decisions required") },
+    });
+    // UI 無効中は決定に基づく修正プロンプトはキューされない
+    expect(pi.sentMessages).toHaveLength(1);
+  });
+
+  it("exits pi immediately on Ctrl+C in the decision UI", async () => {
+    const { pi, context } = installExtension();
+    let component: { handleInput(data: string): void } | undefined;
+    // ctx.shutdown() is deferred until agent_settled, so it cannot exit while the
+    // agent is idle. The extension must therefore use an immediate shutdown path;
+    // intercept the self-sent SIGTERM to pin that wiring.
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const command = pi.commands.get("review-loop-preview");
+    if (!command) throw new Error("review-loop-preview command was not registered");
+    try {
+      context.ui.custom.mockImplementation(
+        async (factory: (...args: unknown[]) => unknown) => {
+          component = factory(
+            { requestRender: () => {}, stop: () => {}, terminal: { rows: 60 } },
+            {
+              fg: (_c: string, t: string) => t,
+              bg: (_c: string, t: string) => t,
+              bold: (t: string) => t,
+              italic: (t: string) => t,
+            },
+            {},
+            () => {},
+          ) as { handleInput(data: string): void };
+          return { cancelled: false, decisions: [] };
+        },
+      );
+
+      // 決定 UI はループ完了時に無効化中のため、wiring はプレビュー経由で検証する
+      await command.handler("", context);
+
+      expect(component).toBeDefined();
+      component?.handleInput("\u0003");
+
+      expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGTERM");
+    } finally {
+      killSpy.mockRestore();
+    }
+  });
+
+  it("shows the text result instead of the UI outside TUI mode", async () => {
+    const { pi, context } = installExtension();
+    context.mode = "rpc";
+    context.hasUI = false;
+
+    await runLoop(pi, context, "1");
+    await emit(
+      pi,
+      "agent_end",
+      context,
+      assistantEvent(`Review found one finding.\n\n${DECISION_JSON}`),
+    );
+
+    expect(context.ui.custom).not.toHaveBeenCalled();
+    expect(pi.entries).toContainEqual({
+      type: "pi-review-loop-result",
+      data: { content: expect.stringContaining("User decisions required") },
     });
   });
 
