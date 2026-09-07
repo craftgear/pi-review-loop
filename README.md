@@ -22,6 +22,19 @@ pi install -l ./plugins/pi-review-loop
 
 The package is tested with Pi `0.84.2` on Node.js `24.15.0`. Pi `0.84.2` requires Node.js `22.19.0` or newer.
 
+OMP compatibility was verified with `18.1.13`. When the host does not support
+`registerEntryRenderer`, final results use custom message rendering instead.
+Display-only results are excluded from model context and published after the
+session settles, without triggering another model turn. On OMP, the review/fix
+sequence uses `session_stop` continuations; Pi retains its `agent_settled` flow.
+A run that ends in an error or without a result does not stop the loop at
+`session_stop`: it stops only when the session settles without a follow-up
+run, matching Pi's retry semantics.
+
+Regression coverage includes hosts without entry rendering, deferred result
+publication, and OMP's `session_stop` → `agent_end` ordering. The original tests
+used Pi's API and lifecycle only, so they did not catch these OMP differences.
+
 ## Usage
 
 Run Pi in the worktree that should be reviewed, then execute:

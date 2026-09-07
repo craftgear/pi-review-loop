@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { setImmediate as nextEventLoopTurn } from "node:timers/promises";
 import {
   AssistantMessageComponent,
   CONFIG_DIR_NAME,
@@ -6,6 +7,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type {
   ExtensionAPI,
+  ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -297,15 +299,37 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
   let latestReviewText: string | undefined;
   let latestFixText: string | undefined;
   let agentEndWithoutText = false;
+  let handledSessionStop = false;
+  let commandContext: ExtensionCommandContext | undefined;
 
-  pi.registerEntryRenderer<FinalReviewResultEntry>(
-    FINAL_REVIEW_RESULT_ENTRY_TYPE,
-    (entry) => {
-      const content = entry.data?.content;
-      if (!content) return undefined;
-      return new AssistantMessageComponent(createAssistantMessage(content));
-    },
-  );
+  const supportsEntryRendering = typeof pi.registerEntryRenderer === "function";
+  if (supportsEntryRendering) {
+    pi.registerEntryRenderer<FinalReviewResultEntry>(
+      FINAL_REVIEW_RESULT_ENTRY_TYPE,
+      (entry) => {
+        const content = entry.data?.content;
+        if (!content) return undefined;
+        return new AssistantMessageComponent(createAssistantMessage(content));
+      },
+    );
+  } else {
+    // OMP renders custom messages, but not custom persistence entries.
+    pi.registerMessageRenderer<FinalReviewResultEntry>(
+      FINAL_REVIEW_RESULT_ENTRY_TYPE,
+      (message) => {
+        const content = message.details?.content;
+        if (!content) return undefined;
+        return new AssistantMessageComponent(createAssistantMessage(content));
+      },
+    );
+    pi.on("context", (event) => ({
+      messages: event.messages.filter(
+        (message) =>
+          message.role !== "custom" ||
+          message.customType !== FINAL_REVIEW_RESULT_ENTRY_TYPE,
+      ),
+    }));
+  }
 
   async function runGit(
     args: string[],
@@ -434,11 +458,41 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     if (isTerminal) loopStartedAt = undefined;
   }
 
-  function appendFinalReviewResult(pendingReview: string): void {
-    pi.appendEntry<FinalReviewResultEntry>(
-      FINAL_REVIEW_RESULT_ENTRY_TYPE,
-      { content: formatFinalReviewResult(pendingReview) },
-    );
+  function appendFinalReviewResult(
+    pendingReview: string,
+    ctx: ExtensionContext,
+  ): void {
+    const data = { content: formatFinalReviewResult(pendingReview) };
+    if (supportsEntryRendering) {
+      pi.appendEntry<FinalReviewResultEntry>(FINAL_REVIEW_RESULT_ENTRY_TYPE, data);
+    } else {
+      const command = commandContext;
+      if (!command) {
+        // 防御的: ループはコマンドでしか有効化されないため通常は到達しない
+        ctx.ui.notify(
+          "Could not display the final review result: the command context is unavailable.",
+          "error",
+        );
+        return;
+      }
+      // During OMP session_stop, even triggerTurn:false queues a streaming
+      // message and causes another model call. Publish only after it is idle.
+      // Do not await here: the current lifecycle handler must finish first.
+      void command.waitForIdle().then(async () => {
+        // waitForIdle observes the agent; let OMP finish the surrounding
+        // session-stop maintenance before publishing a display-only message.
+        await nextEventLoopTurn();
+        pi.sendMessage<FinalReviewResultEntry>({
+          customType: FINAL_REVIEW_RESULT_ENTRY_TYPE,
+          content: data.content,
+          display: true,
+          details: data,
+        }, { triggerTurn: false, deliverAs: "nextTurn" });
+      }).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        command.ui.notify(`Could not display the final review result: ${message}`, "error");
+      });
+    }
   }
 
   // ループ完了時にユーザー判断が必要な finding があれば決定 UI を表示し（TUI のみ、
@@ -459,7 +513,7 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
       !ctx.hasUI ||
       ctx.mode !== "tui"
     ) {
-      appendFinalReviewResult(pendingReview);
+      appendFinalReviewResult(pendingReview, ctx);
       return;
     }
 
@@ -478,13 +532,13 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      appendFinalReviewResult(pendingReview);
+      appendFinalReviewResult(pendingReview, ctx);
       ctx.ui.notify(`Could not open the decision preview: ${message}`, "error");
       return;
     }
 
     if (result.cancelled || result.decisions.length < items.length) {
-      appendFinalReviewResult(pendingReview);
+      appendFinalReviewResult(pendingReview, ctx);
       ctx.ui.notify(
         "Decision preview closed. The findings are listed in the final review result.",
         "info",
@@ -563,6 +617,7 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     description:
       "Review and automatically fix the current worktree until clean.",
     handler: async (args, ctx) => {
+      commandContext = ctx;
       const argument = args.trim();
       if (argument === "stop") {
         if (!isReviewLoopActive(state) && state.phase !== "paused") {
@@ -718,7 +773,10 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     ctx.ui.notify("Review loop stopped: user input received.", "warning");
   });
 
-  pi.on("agent_end", async (event, ctx) => {
+  async function handleAgentResult(
+    event: { messages: readonly unknown[] },
+    ctx: ExtensionContext,
+  ): Promise<void> {
     if (!isReviewLoopActive(state)) return;
     if (hasAssistantError(event.messages)) {
       agentEndWithoutText = true;
@@ -798,6 +856,47 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
       content: buildReviewPrompt(configuredReviewPrompt, reviewInstructions),
       expandPromptTemplates: true,
     };
+  }
+
+  pi.on("agent_start", () => {
+    handledSessionStop = false;
+  });
+  pi.on("agent_end", async (event, ctx) => {
+    if (handledSessionStop || ("willContinue" in event && event.willContinue)) return;
+    await handleAgentResult(event, ctx);
+  });
+
+  // OMP emits session_stop BEFORE agent_end and accepts a continuation result.
+  // Pi's published ExtensionAPI does not declare this OMP lifecycle event.
+  const ompEvents = pi as unknown as {
+    on(
+      event: "session_stop",
+      handler: (
+        event: { messages: readonly unknown[]; last_assistant_message?: unknown },
+        ctx: ExtensionContext,
+      ) => Promise<{ continue: true; additionalContext: string } | undefined>,
+    ): void;
+  };
+  ompEvents.on("session_stop", async (event, ctx) => {
+    // 同一ランの二重発火防止: 結果の再処理と継続の二重許可を防ぐ
+    if (handledSessionStop) return undefined;
+    handledSessionStop = true;
+    await handleAgentResult({
+      messages: event.last_assistant_message
+        ? [event.last_assistant_message]
+        : event.messages,
+    }, ctx);
+    if (!isReviewLoopActive(state)) return undefined;
+    if (!pendingPrompt) {
+      // エラーや結果なしのランはリトライの可能性があるため、
+      // Pi の agent_end パスと同様に停止の判定を agent_settled に委ねる
+      if (agentEndWithoutText) return undefined;
+      stopForProtocolError(ctx, "The agent ended without a review-loop result. The loop was stopped.");
+      return undefined;
+    }
+    const nextPrompt = pendingPrompt;
+    pendingPrompt = undefined;
+    return { continue: true, additionalContext: nextPrompt.content };
   });
 
   pi.on("agent_settled", async (_event, ctx) => {

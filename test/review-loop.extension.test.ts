@@ -17,6 +17,7 @@ type FakeContext = {
   mode: "tui" | "rpc" | "json" | "print";
   hasUI: boolean;
   isIdle: ReturnType<typeof vi.fn>;
+  waitForIdle: () => Promise<void>;
   abort: ReturnType<typeof vi.fn>;
   cwd: string;
   isProjectTrusted: ReturnType<typeof vi.fn>;
@@ -88,6 +89,7 @@ function createContext(overrides: Partial<FakeContext> = {}): FakeContext {
     mode: "tui",
     hasUI: true,
     isIdle: vi.fn(() => true),
+    waitForIdle: async () => {},
     abort: vi.fn(),
     cwd: "/tmp/pi-review-loop-test",
     isProjectTrusted: vi.fn(() => true),
@@ -195,6 +197,201 @@ describe("review loop extension", () => {
         .splice(0)
         .map((directory) => rm(directory, { recursive: true, force: true })),
     );
+  });
+
+  it("shows the final result without entry rendering and excludes only that result from model context", async () => {
+    const pi = new FakePi();
+    type ResultMessage = {
+      customType: string;
+      content: string;
+      display: boolean;
+      details: { content: string };
+    };
+    type ResultRenderer = (message: ResultMessage) => AssistantMessageComponent | undefined;
+    const renderers = new Map<string, ResultRenderer>();
+    const messages: ResultMessage[] = [];
+    Object.defineProperty(pi, "registerEntryRenderer", { value: undefined });
+    Object.assign(pi, {
+      registerMessageRenderer: (type: string, renderer: ResultRenderer) =>
+        renderers.set(type, renderer),
+      sendMessage: (message: ResultMessage, options: unknown) => {
+        expect(options).toEqual({ triggerTurn: false, deliverAs: "nextTurn" });
+        messages.push(message);
+      },
+    });
+    reviewLoopExtension(pi as unknown as ExtensionAPI);
+    let settle!: () => void;
+    const idle = new Promise<void>((resolve) => { settle = resolve; });
+    const context = createContext({ waitForIdle: () => idle });
+
+    await runLoop(pi, context, "1");
+    await emit(pi, "agent_end", context, assistantEvent("Authorization needs a user decision."));
+
+    expect(lastStateEntry(pi)).toMatchObject({ data: { phase: "completed" } });
+    expect(messages).toEqual([]);
+    settle();
+    await idle;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(messages).toEqual([
+      expect.objectContaining({
+        customType: "pi-review-loop-result",
+        display: true,
+        content: expect.stringContaining("Authorization needs a user decision."),
+      }),
+    ]);
+    const renderer = renderers.get("pi-review-loop-result");
+    if (!renderer) throw new Error("result renderer was not registered");
+    const component = renderer(messages[0]);
+    if (!component) throw new Error("result did not render");
+    const rendered = component.render(100).join("\n");
+    expect(rendered).toContain("Authorization needs a user decision.");
+    expect(pi.sentMessages).toHaveLength(1);
+
+    const user = { role: "user", content: "Continue" };
+    const unrelated = { role: "custom", customType: "another-extension", content: "Keep this" };
+    const result = { role: "custom", ...messages[0] };
+    expect(await emit(pi, "context", context, { messages: [user, result, unrelated] }))
+      .toEqual({ messages: [user, unrelated] });
+    expect(await emit(pi, "context", context, { messages: [user, unrelated] }))
+      .toEqual({ messages: [user, unrelated] });
+  });
+
+  it("continues review and fixing through OMP session_stop without starting another user turn", async () => {
+    const { pi, context } = installExtension();
+    await runLoop(pi, context);
+    await emit(pi, "agent_start", context);
+    const review = assistantEvent("Authorization needs a user decision.");
+    expect(await emit(pi, "session_stop", context, review)).toEqual({
+      continue: true,
+      additionalContext: expect.stringContaining("fix them"),
+    });
+    // OMP notifies agent_end only after session_stop: do not treat the same
+    // review as a fix result and finish before the actual fix has run.
+    await emit(pi, "agent_end", context, review);
+    expect(lastStateEntry(pi)).toMatchObject({ data: { phase: "fixing" } });
+    await emit(pi, "agent_start", context);
+    const fix = assistantEvent("No safe changes can be made.");
+    expect(await emit(pi, "session_stop", context, {
+      messages: [...review.messages, ...fix.messages],
+      last_assistant_message: fix.messages[0],
+    })).toBeUndefined();
+    await emit(pi, "agent_end", context, fix);
+    expect(lastStateEntry(pi)).toMatchObject({
+      data: { phase: "completed", completionReason: "no_changes" },
+    });
+    expect(pi.sentMessages).toHaveLength(1);
+  });
+
+  it("waits for a retry run after a provider error at OMP session_stop", async () => {
+    const { pi, context } = installExtension();
+    await runLoop(pi, context);
+    await emit(pi, "agent_start", context);
+    const errorEvent = {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "rate limited" }],
+          stopReason: "error",
+        },
+      ],
+    };
+    expect(await emit(pi, "session_stop", context, errorEvent)).toBeUndefined();
+    // Pi's agent_end path survives an error run because a retry may follow;
+    // the session_stop path must wait for agent_settled instead of stopping.
+    expect(lastStateEntry(pi)).toMatchObject({ data: { phase: "reviewing" } });
+
+    await emit(pi, "agent_start", context);
+    const review = assistantEvent("Authorization needs a user decision.");
+    expect(await emit(pi, "session_stop", context, review)).toEqual({
+      continue: true,
+      additionalContext: expect.stringContaining("fix them"),
+    });
+  });
+
+  it("stops with a protocol error when the OMP error run is not retried", async () => {
+    const { pi, context } = installExtension();
+    await runLoop(pi, context);
+    await emit(pi, "agent_start", context);
+    await emit(pi, "session_stop", context, {
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "rate limited" }],
+          stopReason: "error",
+        },
+      ],
+    });
+
+    // The stop happens on settle, exactly like Pi's un-retried error path.
+    await emit(pi, "agent_settled", context);
+
+    expect(lastStateEntry(pi)).toMatchObject({
+      data: { phase: "stopped", stopReason: "protocol_error" },
+    });
+    expect(context.ui.notify).toHaveBeenCalledWith(
+      "The agent ended without a review-loop result. The loop was stopped.",
+      "error",
+    );
+  });
+
+  it("ignores a duplicate OMP session_stop for the same run", async () => {
+    const { pi, context } = installExtension();
+    await runLoop(pi, context);
+    await emit(pi, "agent_start", context);
+    const review = assistantEvent("Authorization needs a user decision.");
+    expect(await emit(pi, "session_stop", context, review)).toEqual({
+      continue: true,
+      additionalContext: expect.stringContaining("fix them"),
+    });
+
+    // A second fire for the same run must not reprocess the result or
+    // grant another continuation.
+    expect(await emit(pi, "session_stop", context, review)).toBeUndefined();
+    expect(lastStateEntry(pi)).toMatchObject({ data: { phase: "fixing" } });
+    expect(
+      pi.entries.filter((entry) => entry.type === "pi-review-loop-result"),
+    ).toHaveLength(0);
+  });
+
+  it("stops clearly when OMP does not re-fire agent_start for a continued run", async () => {
+    const { pi, context } = installExtension();
+    await runLoop(pi, context);
+    await emit(pi, "agent_start", context);
+    const review = assistantEvent("Authorization needs a user decision.");
+    expect(await emit(pi, "session_stop", context, review)).toEqual({
+      continue: true,
+      additionalContext: expect.stringContaining("fix them"),
+    });
+
+    // If the host does not re-fire agent_start for the continued run, the
+    // duplicate-fire guard must keep the second session_stop from
+    // reprocessing the stale result; the loop then stops at settle instead
+    // of hanging or publishing a duplicate final result.
+    const fix = assistantEvent("No safe changes can be made.");
+    expect(await emit(pi, "session_stop", context, fix)).toBeUndefined();
+    await emit(pi, "agent_settled", context);
+
+    expect(lastStateEntry(pi)).toMatchObject({
+      data: { phase: "stopped", stopReason: "protocol_error" },
+    });
+    expect(
+      pi.entries.filter((entry) => entry.type === "pi-review-loop-result"),
+    ).toHaveLength(0);
+  });
+
+  it("skips an OMP agent_end that will continue via session_stop", async () => {
+    const { pi, context } = installExtension();
+    await runLoop(pi, context);
+    const review = assistantEvent("Authorization needs a user decision.");
+    await emit(pi, "agent_end", context, { ...review, willContinue: true });
+
+    // The result must not be consumed before session_stop is consulted.
+    expect(lastStateEntry(pi)).toMatchObject({ data: { phase: "reviewing" } });
+
+    expect(await emit(pi, "session_stop", context, review)).toEqual({
+      continue: true,
+      additionalContext: expect.stringContaining("fix them"),
+    });
   });
 
   it("opens the interactive user-decision preview without starting a review", async () => {
