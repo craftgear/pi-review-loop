@@ -735,7 +735,14 @@ describe("review loop extension", () => {
     );
   });
 
-  it("uses the trusted project review prompt configuration", async () => {
+  it.each([
+    ["", "Review only the authentication flow."],
+    ["   ", "Review only the authentication flow."],
+    [
+      "Focus on authorization checks",
+      "/skill:code-review Focus on authorization checks Do not modify files during this review.",
+    ],
+  ])("uses configuration unless command instructions are supplied: %j", async (argument, expectedPrompt) => {
     const directory = await mkdtemp(join("/tmp", "pi-review-loop-config-"));
     temporaryDirectories.push(directory);
     await mkdir(join(directory, ".pi"), { recursive: true });
@@ -748,10 +755,9 @@ describe("review loop extension", () => {
     const command = pi.commands.get("review-loop");
     if (!command) throw new Error("review-loop command was not registered");
 
-    await command.handler("", context);
+    await command.handler(argument, context);
 
-    // 無効化中はカスタム reviewPrompt にも JSON 出力指示は付与されない
-    expect(pi.sentMessages[0].content).toBe("Review only the authentication flow.");
+    expect(pi.sentMessages[0].content).toBe(expectedPrompt);
   });
 
   it("accepts a review prompt without an explicit round limit", async () => {
@@ -761,8 +767,8 @@ describe("review loop extension", () => {
 
     await command.handler("Focus on authorization checks", context);
 
-    expect(pi.sentMessages[0].content).toContain(
-      "Additional review instructions: Focus on authorization checks",
+    expect(pi.sentMessages[0].content).toBe(
+      "/skill:code-review Focus on authorization checks Do not modify files during this review.",
     );
     expect(pi.entries[0]).toEqual({
       type: "pi-review-loop-state",
@@ -776,8 +782,8 @@ describe("review loop extension", () => {
     if (!command) throw new Error("review-loop command was not registered");
 
     await command.handler("3 Focus on authorization checks", context);
-    expect(pi.sentMessages[0].content).toContain(
-      "Additional review instructions: Focus on authorization checks",
+    expect(pi.sentMessages[0].content).toBe(
+      "/skill:code-review Focus on authorization checks Do not modify files during this review.",
     );
     expect(pi.entries[0]).toEqual({
       type: "pi-review-loop-state",
@@ -800,9 +806,7 @@ describe("review loop extension", () => {
     );
     await emit(pi, "agent_settled", context);
 
-    expect(pi.sentMessages[2].content).toContain(
-      "Additional review instructions: Focus on authorization checks",
-    );
+    expect(pi.sentMessages[2].content).toBe(pi.sentMessages[0].content);
   });
 
   it("records a user-decision item when no safe fix is made", async () => {

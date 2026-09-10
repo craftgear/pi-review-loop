@@ -111,13 +111,12 @@ function buildDecisionFixPrompt(
 
 function buildReviewPrompt(
   reviewPrompt: string,
-  additionalInstructions: string | undefined,
+  instructions: string | undefined,
 ): string {
   return [
-    reviewPrompt,
-    ...(additionalInstructions
-      ? [`Additional review instructions: ${additionalInstructions}`]
-      : []),
+    instructions
+      ? `/skill:code-review ${instructions} Do not modify files during this review.`
+      : reviewPrompt,
     // 設定されたプロンプトが何であっても判断必要 finding は JSON で出力させる（一時的に無効化中）
     ...(DECISION_ITEMS_PROMPT_ENABLED ? [DECISION_ITEMS_PROMPT] : []),
   ].join(" ");

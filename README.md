@@ -43,7 +43,7 @@ Run Pi in the worktree that should be reviewed, then execute:
 /review-loop
 ```
 
-The default limit is ten review rounds. An optional round limit and additional review instructions can be supplied:
+The default limit is ten review rounds. An optional round limit and replacement review instructions can be supplied:
 
 ```text
 /review-loop 3
@@ -51,7 +51,7 @@ The default limit is ten review rounds. An optional round limit and additional r
 /review-loop 3 Focus on authorization checks
 ```
 
-The additional instructions are applied to each review round. A limit from one to ten can be supplied.
+The supplied instructions replace the default review instructions in every review round, while preserving `/skill:code-review` and `Do not modify files during this review.` A limit from one to ten can be supplied.
 
 Preview the interactive user-decision UI without starting a review:
 
@@ -71,7 +71,7 @@ Set the review prompt in `~/.pi/agent/review-loop.json` for all projects or in `
 }
 ```
 
-The default is the prompt shown above. The project config overrides the global config, and project config is read only for trusted projects. A prompt passed to `/review-loop` is appended as additional review instructions.
+The default is the prompt shown above. The project config overrides the global config, and project config is read only for trusted projects. A prompt passed to `/review-loop` takes precedence over configuration and is wrapped with `/skill:code-review` and `Do not modify files during this review.` Without a command prompt, the configured prompt is used unchanged.
 
 Stop an active loop with:
 
