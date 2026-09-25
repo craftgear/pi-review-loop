@@ -262,8 +262,8 @@ describe("review loop extension", () => {
     await emit(pi, "agent_start", context);
     const review = assistantEvent("Authorization needs a user decision.");
     expect(await emit(pi, "session_stop", context, review)).toEqual({
-      continue: true,
-      additionalContext: expect.stringContaining("fix them"),
+      decision: "block",
+      reason: expect.stringContaining("fix them"),
     });
     // OMP notifies agent_end only after session_stop: do not treat the same
     // review as a fix result and finish before the actual fix has run.
@@ -280,6 +280,50 @@ describe("review loop extension", () => {
       data: { phase: "completed", completionReason: "no_changes" },
     });
     expect(pi.sentMessages).toHaveLength(1);
+  });
+
+  it("continues all ten rounds without consuming OMP's advisory continuation cap", async () => {
+    const { pi, context } = installExtension();
+    await runLoop(pi, context);
+
+    for (let round = 1; round <= 10; round += 1) {
+      await emit(pi, "agent_start", context);
+      const review = assistantEvent(`Review ${round} found an actionable issue.`);
+      const reviewResult = await emit(pi, "session_stop", context, review);
+
+      if (round === 10) {
+        expect(reviewResult).toBeUndefined();
+        break;
+      }
+
+      expect(reviewResult).toEqual({
+        decision: "block",
+        reason: expect.stringContaining("fix them"),
+      });
+      expect(lastStateEntry(pi)).toMatchObject({
+        data: { phase: "fixing", round },
+      });
+
+      await emit(pi, "agent_start", context);
+      await emit(pi, "tool_execution_end", context, toolEnd("edit"));
+      const fix = assistantEvent(`Applied the safe fixes from review ${round}.`);
+      expect(await emit(pi, "session_stop", context, fix)).toEqual({
+        decision: "block",
+        reason: expect.stringContaining("/skill:code-review"),
+      });
+      expect(lastStateEntry(pi)).toMatchObject({
+        data: { phase: "reviewing", round: round + 1 },
+      });
+    }
+
+    expect(lastStateEntry(pi)).toMatchObject({
+      data: {
+        phase: "completed",
+        round: 10,
+        maxRounds: 10,
+        completionReason: "max_rounds",
+      },
+    });
   });
 
   it("waits for a retry run after a provider error at OMP session_stop", async () => {
@@ -303,8 +347,8 @@ describe("review loop extension", () => {
     await emit(pi, "agent_start", context);
     const review = assistantEvent("Authorization needs a user decision.");
     expect(await emit(pi, "session_stop", context, review)).toEqual({
-      continue: true,
-      additionalContext: expect.stringContaining("fix them"),
+      decision: "block",
+      reason: expect.stringContaining("fix them"),
     });
   });
 
@@ -340,8 +384,8 @@ describe("review loop extension", () => {
     await emit(pi, "agent_start", context);
     const review = assistantEvent("Authorization needs a user decision.");
     expect(await emit(pi, "session_stop", context, review)).toEqual({
-      continue: true,
-      additionalContext: expect.stringContaining("fix them"),
+      decision: "block",
+      reason: expect.stringContaining("fix them"),
     });
 
     // A second fire for the same run must not reprocess the result or
@@ -359,8 +403,8 @@ describe("review loop extension", () => {
     await emit(pi, "agent_start", context);
     const review = assistantEvent("Authorization needs a user decision.");
     expect(await emit(pi, "session_stop", context, review)).toEqual({
-      continue: true,
-      additionalContext: expect.stringContaining("fix them"),
+      decision: "block",
+      reason: expect.stringContaining("fix them"),
     });
 
     // If the host does not re-fire agent_start for the continued run, the
@@ -389,75 +433,15 @@ describe("review loop extension", () => {
     expect(lastStateEntry(pi)).toMatchObject({ data: { phase: "reviewing" } });
 
     expect(await emit(pi, "session_stop", context, review)).toEqual({
-      continue: true,
-      additionalContext: expect.stringContaining("fix them"),
+      decision: "block",
+      reason: expect.stringContaining("fix them"),
     });
   });
 
-  it("opens the interactive user-decision preview without starting a review", async () => {
-    const { pi, context } = installExtension();
-    const command = pi.commands.get("review-loop-preview");
-    if (!command) throw new Error("review-loop-preview command was not registered");
+  it("does not register the removed review-loop-preview command", () => {
+    const { pi } = installExtension();
 
-    await command.handler("", context);
-
-    // The preview is an inline (non-overlay) UI that replaces the editor area
-    expect(context.ui.custom).toHaveBeenCalledWith(expect.any(Function));
-    expect(pi.sentMessages).toHaveLength(0);
-    expect(context.ui.notify).toHaveBeenCalledWith(
-      "Review decision preview closed.",
-      "info",
-    );
-  });
-
-  it("starts fixing with an English prompt when every issue is decided", async () => {
-    const { pi, context } = installExtension();
-    context.ui.custom.mockResolvedValueOnce({
-      cancelled: false,
-      decisions: [
-        { id: "long-user-name", value: "Postpone", type: "preset" },
-        { id: "payment-failure-message", value: "保留対応", type: "custom" },
-      ],
-    });
-    const command = pi.commands.get("review-loop-preview");
-    if (!command) throw new Error("review-loop-preview command was not registered");
-
-    await command.handler("", context);
-
-    expect(pi.sentMessages).toHaveLength(1);
-    const prompt = pi.sentMessages[0].content;
-    expect(prompt).toContain(
-      "Long user names overflow the admin list: Postpone",
-    );
-    expect(prompt).toContain(
-      "Payment failures do not explain the next step: 保留対応",
-    );
-    expect(prompt).toContain("Apply only safe, actionable fixes");
-    expect(context.ui.notify).toHaveBeenCalledWith(
-      "All findings decided. Starting fixes.",
-      "info",
-    );
-  });
-
-  it("surfaces an error when the decision fix prompt cannot be queued", async () => {
-    const { pi, context } = installExtension();
-    context.ui.custom.mockResolvedValueOnce({
-      cancelled: false,
-      decisions: [
-        { id: "long-user-name", value: "Postpone", type: "preset" },
-        { id: "payment-failure-message", value: "Postpone", type: "preset" },
-      ],
-    });
-    pi.sendUserMessage.mockRejectedValueOnce(new Error("queue failed"));
-    const command = pi.commands.get("review-loop-preview");
-    if (!command) throw new Error("review-loop-preview command was not registered");
-
-    await command.handler("", context);
-
-    expect(context.ui.notify).toHaveBeenCalledWith(
-      "Could not start fixing: queue failed",
-      "error",
-    );
+    expect(pi.commands.has("review-loop-preview")).toBe(false);
   });
 
   it("ignores a provider error run and continues with the retried run", async () => {
@@ -886,44 +870,6 @@ describe("review loop extension", () => {
     expect(pi.sentMessages).toHaveLength(1);
   });
 
-  it("exits pi immediately on Ctrl+C in the decision UI", async () => {
-    const { pi, context } = installExtension();
-    let component: { handleInput(data: string): void } | undefined;
-    // ctx.shutdown() is deferred until agent_settled, so it cannot exit while the
-    // agent is idle. The extension must therefore use an immediate shutdown path;
-    // intercept the self-sent SIGTERM to pin that wiring.
-    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
-    const command = pi.commands.get("review-loop-preview");
-    if (!command) throw new Error("review-loop-preview command was not registered");
-    try {
-      context.ui.custom.mockImplementation(
-        async (factory: (...args: unknown[]) => unknown) => {
-          component = factory(
-            { requestRender: () => {}, stop: () => {}, terminal: { rows: 60 } },
-            {
-              fg: (_c: string, t: string) => t,
-              bg: (_c: string, t: string) => t,
-              bold: (t: string) => t,
-              italic: (t: string) => t,
-            },
-            {},
-            () => {},
-          ) as { handleInput(data: string): void };
-          return { cancelled: false, decisions: [] };
-        },
-      );
-
-      // 決定 UI はループ完了時に無効化中のため、wiring はプレビュー経由で検証する
-      await command.handler("", context);
-
-      expect(component).toBeDefined();
-      component?.handleInput("\u0003");
-
-      expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGTERM");
-    } finally {
-      killSpy.mockRestore();
-    }
-  });
 
   it("shows the text result instead of the UI outside TUI mode", async () => {
     const { pi, context } = installExtension();

@@ -22,11 +22,12 @@ pi install -l ./plugins/pi-review-loop
 
 The package is tested with Pi `0.84.2` on Node.js `24.15.0`. Pi `0.84.2` requires Node.js `22.19.0` or newer.
 
-OMP compatibility was verified with `18.1.13`. When the host does not support
+OMP compatibility was verified with `18.3.0`. When the host does not support
 `registerEntryRenderer`, final results use custom message rendering instead.
 Display-only results are excluded from model context and published after the
 session settles, without triggering another model turn. On OMP, the review/fix
-sequence uses `session_stop` continuations; Pi retains its `agent_settled` flow.
+sequence uses blocking `session_stop` continuations, which do not consume OMP's
+advisory continuation allowance; Pi retains its `agent_settled` flow.
 A run that ends in an error or without a result does not stop the loop at
 `session_stop`: it stops only when the session settles without a follow-up
 run, matching Pi's retry semantics.
@@ -52,14 +53,6 @@ The default limit is ten review rounds. An optional round limit and replacement 
 ```
 
 The supplied instructions replace the default review instructions in every review round, while preserving `/skill:code-review` and `Do not modify files during this review.` A limit from one to ten can be supplied.
-
-Preview the interactive user-decision UI without starting a review:
-
-```text
-/review-loop-preview
-```
-
-The preview demonstrates per-issue accordion sections, preset actions, custom decisions, and persistent keyboard hints. Use the arrow keys to move or choose, Space to expand or collapse an issue, j/k or the mouse wheel to scroll the issue details, PgUp/PgDn for page scrolling, Enter to confirm, Tab to move to the next issue, and Escape to go back or close the preview.
 
 ## Configuration
 

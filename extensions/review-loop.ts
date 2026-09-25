@@ -32,13 +32,11 @@ import {
   type ReviewDecisionPreviewItem,
 } from "../src/reviewDecisionItems";
 import {
-  PREVIEW_DECISION_ITEMS,
   ReviewDecisionPreviewComponent,
   type ReviewDecisionPreviewResult,
 } from "./review-decision-preview";
 
 const COMMAND_NAME = "review-loop";
-const PREVIEW_COMMAND_NAME = "review-loop-preview";
 const RESUME_PHRASES = [
   "go on",
   "continue",
@@ -684,53 +682,6 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerCommand(PREVIEW_COMMAND_NAME, {
-    description: "Preview the interactive user-decision review UI.",
-    handler: async (_args, ctx) => {
-      if (!ctx.hasUI || ctx.mode !== "tui") {
-        ctx.ui.notify(
-          "The review decision preview is available only in TUI mode.",
-          "warning",
-        );
-        return;
-      }
-
-      const result = await ctx.ui.custom<ReviewDecisionPreviewResult>(
-        (tui, theme, _keybindings, done) =>
-          new ReviewDecisionPreviewComponent(
-            PREVIEW_DECISION_ITEMS,
-            tui,
-            theme,
-            done,
-            // 単発 Ctrl+C で即座に graceful 終了する
-            requestImmediateShutdown,
-          ),
-      );
-
-      if (result.cancelled) {
-        ctx.ui.notify("Review decision preview closed.", "info");
-        return;
-      }
-      if (result.decisions.length < PREVIEW_DECISION_ITEMS.length) {
-        ctx.ui.notify(
-          `Preview completed with ${result.decisions.length}/${PREVIEW_DECISION_ITEMS.length} decisions.`,
-          "info",
-        );
-        return;
-      }
-      // 全項目が決定済み: 決定に基づいて修正を自動開始する
-      ctx.ui.notify("All findings decided. Starting fixes.", "info");
-      try {
-        await pi.sendUserMessage(
-          buildDecisionFixPrompt(PREVIEW_DECISION_ITEMS, result),
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`Could not start fixing: ${message}`, "error");
-      }
-    },
-  });
-
   pi.on("session_start", async (_event, ctx) => {
     state = createIdleState();
     resetRunData();
@@ -865,7 +816,7 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     await handleAgentResult(event, ctx);
   });
 
-  // OMP emits session_stop BEFORE agent_end and accepts a continuation result.
+  // OMP emits session_stop BEFORE agent_end and accepts a blocking continuation.
   // Pi's published ExtensionAPI does not declare this OMP lifecycle event.
   const ompEvents = pi as unknown as {
     on(
@@ -873,7 +824,7 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
       handler: (
         event: { messages: readonly unknown[]; last_assistant_message?: unknown },
         ctx: ExtensionContext,
-      ) => Promise<{ continue: true; additionalContext: string } | undefined>,
+      ) => Promise<{ decision: "block"; reason: string } | undefined>,
     ): void;
   };
   ompEvents.on("session_stop", async (event, ctx) => {
@@ -895,7 +846,7 @@ export default function reviewLoopExtension(pi: ExtensionAPI): void {
     }
     const nextPrompt = pendingPrompt;
     pendingPrompt = undefined;
-    return { continue: true, additionalContext: nextPrompt.content };
+    return { decision: "block", reason: nextPrompt.content };
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
